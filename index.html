@@ -3266,7 +3266,6 @@ function startReveal(list, winner){
   G.phase='reveal'; G.winner=winner; G.revealList=list;
   closePaintMode(); closePoseWheel();
   $('blackout').classList.add('hidden');
-  huntMusicStop();
   document.exitPointerLock && document.exitPointerLock();
   tour = {list, i:-1, t:0, ang:0};
   nextTourStop();
@@ -3502,11 +3501,9 @@ function onPhaseLocal(phase){
       ? 'Round '+G.round+' — HIDE! Run (WASD), climb walls (Space/Shift at a wall), lean into a painting, then paint yourself (F).'
       : 'Round '+G.round+' — you are LOCKED IN while they hide…');
     sfxHorn();
-    huntMusicStop();
   }
   else if(phase==='hunt'){
     $('blackout').classList.add('hidden');
-    huntMusicStart();
     closePoseWheel();
     if(p.role==='seeker' && !p.caught){
       closePaintMode();
@@ -3636,16 +3633,6 @@ function audioInit(){
   if(AC) return;
   try{ AC = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){}
 }
-/* hunt background music — primed (played+paused) on the same click that
-   unlocks AC, so the real play() during onPhaseLocal isn't blocked by
-   browser autoplay restrictions */
-const huntMusic = new Audio('hunt-theme.mp3');
-huntMusic.loop = true; huntMusic.volume = 0.45;
-function huntMusicPrime(){
-  huntMusic.play().then(()=>{ huntMusic.pause(); huntMusic.currentTime = 0; }).catch(()=>{});
-}
-function huntMusicStart(){ huntMusic.currentTime = 0; huntMusic.play().catch(()=>{}); }
-function huntMusicStop(){ huntMusic.pause(); huntMusic.currentTime = 0; }
 function blip(freq, dur, type, gain, when, panner){
   if(!AC) return;
   const t0 = AC.currentTime + (when||0);
@@ -3761,13 +3748,11 @@ setInterval(()=>{
    ===================================================================== */
 $('btnCreate').onclick = ()=>{
   audioInit();
-  huntMusicPrime();
   localStorage.setItem('mc3d-name', $('nameInput').value.trim());
   startConnection(true, genCode());
 };
 $('btnJoin').onclick = ()=>{
   audioInit();
-  huntMusicPrime();
   const code = $('codeInput').value.trim().toUpperCase();
   if(code.length<3){ $('menuErr').textContent='Enter the room code.'; return; }
   localStorage.setItem('mc3d-name', $('nameInput').value.trim());
