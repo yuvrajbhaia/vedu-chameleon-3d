@@ -983,6 +983,7 @@ function buildMap(){
 
   if(typeof buildProps==='function') buildProps();   // sign walls + prop clutter
   if(typeof buildWing==='function') buildWing();     // garage/warehouse/depot/arcade/junkyard
+  if(typeof buildExtraCover==='function') buildExtraCover();   // lots more hideable props
 }
 /* embedded public-domain artworks (Wikimedia Commons) */
 const ART = {
@@ -2175,6 +2176,64 @@ function buildWing() {
   wingTaxiDepot();
   wingArcadeRoom();
   wingJunkyard();
+}
+/* ====================================================================
+   EXTRA COVER — a LOT more solid props to hide behind, spread across
+   every room. All are real colliders (crate piles, cabinets, barrel
+   stacks, spools, pallets). Placed clear of doorways, the seeker spawn
+   (-19,-13), and the hung paintings/signs.
+   ==================================================================== */
+function buildExtraCover() {
+  const CR = { canvas:{ w:128, h:128, draw:propDrawCrate }, rough:0.85 };
+  const crate = (x,z,s,y) => addBox(s,s,s, x, (y==null? s/2 : y), z, CR);      // wooden crate (collider)
+  const cab   = (x,z,w,h,d,c) => addBox(w,h,d, x, h/2, z, { color:c, rough:0.8, metal:0.12 });  // cabinet/locker
+  const barrelStack = (x,z,cols) => {                                          // 2-3 stacked drums
+    for(let i=0;i<cols.length;i++) propBarrel(x, z, 0.55 + i*1.1, cols[i]);
+    propSolid(x, z, 0.5, 0.5, 0.55 + (cols.length-1)*1.1 + 0.55);
+  };
+
+  // ---- NW LOUNGE (x<0,z<0) — spawn corner (-19,-13) kept clear ----
+  wingCratePile(-6.0, -9.0);
+  wingPalletStack(-11.5, -5.5);
+  barrelStack(-13.5, -8.5, ['#e63946','#ffd23f']);
+  crate(-4.0, -10.5, 1.1); crate(-4.2, -11.6, 0.9, 1.5);
+  cab(-20.5, -5.5, 1.0, 2.4, 1.8, '#5b6472');            // west-wall locker
+  crate(-9.5, -12.2, 1.0);
+  wingSpool(-16.5, -6.5, 0.85, 1.3, '#c9863f');
+
+  // ---- NE GALLERY (x>0,z<0) — clear of Starry(x9)/Wave/Sketch + sign wall ----
+  wingCratePile(4.0, -9.5);
+  barrelStack(11.5, -9.5, ['#2ec27e','#3f88ff','#ffd23f']);
+  wingPalletStack(6.5, -12.5);
+  crate(18.5, -9.5, 1.1); crate(18.6, -10.6, 0.9, 1.5);
+  wingSpool(8.5, -5.5, 0.9, 1.4, '#d9a05b');
+  cab(2.5, -6.0, 1.4, 2.0, 1.4, '#4b5563');
+  crate(20.0, -4.5, 1.0);
+
+  // ---- SW STUDY (x<0,z>0) — clear of jungleArt/bookshelf/desk ----
+  wingCratePile(-6.5, 10.5);
+  barrelStack(-17.0, 10.5, ['#9d4edd','#e63946']);
+  wingPalletStack(-15.5, 4.5);
+  crate(-9.5, 12.5, 1.1); crate(-9.7, 13.6, 0.9, 1.5);
+  cab(-3.4, 9.6, 1.6, 2.0, 1.0, '#5a4a36');
+  crate(-13.0, 13.5, 1.0);
+  wingSpool(-11.5, 4.5, 0.85, 1.3, '#c9863f');
+
+  // ---- SE KITCHEN (x>0,z>0) — clear of counter/planter/watching-photo ----
+  wingCratePile(6.8, 10.0);
+  barrelStack(9.5, 6.5, ['#2ec27e','#ffd23f']);
+  wingPalletStack(14.5, 12.5);
+  crate(13.0, 13.6, 1.1); crate(13.2, 12.5, 0.9, 1.5);
+  cab(4.0, 9.5, 1.5, 2.0, 1.0, '#4b5563');
+  crate(6.0, 13.5, 1.0);
+  wingSpool(20.0, 10.0, 0.85, 1.3, '#d9a05b');
+
+  // ---- WING ROOMS: a bit more cover (clear of vehicles + partition doors) ----
+  wingCratePile(-6.0, -20.5);  wingBarrels(-4.5, -29.0);     // garage
+  wingPalletStack(13.5, -27.5); wingCratePile(3.5, -26.5);   // warehouse
+  wingCratePile(-19.0, 20.0);  wingPalletStack(-12.0, 29.0); // taxi depot
+  wingCratePile(-2.0, 28.5);                                 // arcade
+  wingTireStack(13.5, 20.5, 4); wingBarrels(19.0, 29.0);     // junkyard
 }
 /* =====================================================================
    CHARACTER v3 — one seamless clay "bean person" (lathe body: head melts
