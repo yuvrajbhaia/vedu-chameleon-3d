@@ -267,6 +267,7 @@ select{width:100%; background:#0d1219; color:var(--ink); border:1px solid var(--
   <div id="aliveChip">🦎 <span id="aliveN">0</span> hidden</div>
   <canvas id="minimap" width="150" height="218" class="hidden" style="position:fixed;left:12px;bottom:12px;z-index:40;border:1px solid rgba(255,255,255,.22);border-radius:8px;pointer-events:none;"></canvas>
   <button id="btnUnstick" class="btn mini" style="position:fixed;right:12px;bottom:12px;z-index:41;pointer-events:auto;" title="Force-unstick (T)">↻ Unstick</button>
+  <button id="btnWhistle" class="btn mini" style="position:fixed;right:12px;bottom:52px;z-index:41;pointer-events:auto;display:none;" title="Toggle proximity whistle (Q)">🔈 Whistle: OFF</button>
   <div id="roleBanner" class="hider">YOU ARE A HIDER</div>
   <div id="xhair" class="hidden"></div>
   <div id="shotCd"></div>
@@ -2927,6 +2928,7 @@ addEventListener('keydown', e=>{
   if(k==='v') toggleFreeze();                                 // freeze self + roam / unfreeze
   if(k==='b') toggleSeekerCam();                              // while frozen: mirror the seeker's view
   if(k==='t') forceUnstick();                                 // panic escape hatch (any role)
+  if(k==='q') toggleWhistle();                                // seeker: turn the proximity whistle on/off
   if(G.paintMode && k==='z' && (e.ctrlKey||e.metaKey)){ e.preventDefault(); e.shiftKey ? redoPaint() : undoPaint(); }
   if(G.paintMode && k==='y' && (e.ctrlKey||e.metaKey)){ e.preventDefault(); redoPaint(); }
 });
@@ -3243,7 +3245,13 @@ function updateMinimap(){
   }
   for(const id in G.players){                            // player dots (spectator view → showing all is intended)
     const q=G.players[id]; if(!q) continue;
-    const dx=(q.x-X0)*sx, dz=(q.z-Z0)*sz, self=id===G.myId;
+    const self=id===G.myId;
+    // your own marker tracks the CAMERA (where you're roaming) rather than your frozen
+    // body, so it visibly moves as you fly; everyone else is their live interpolated pos
+    // (updateRemotes refreshes q.x/q.z every frame → their dots move live too)
+    const wx = self ? camera.position.x : q.x;
+    const wz = self ? camera.position.z : q.z;
+    const dx=(wx-X0)*sx, dz=(wz-Z0)*sz;
     cx.beginPath(); cx.arc(dx, dz, self?4:3, 0, 7);
     cx.fillStyle = q.caught ? '#8a94a6' : (q.role==='seeker' ? '#ff4d6d' : '#3ee6c4');
     cx.fill();
@@ -3817,6 +3825,7 @@ function updateHints(){
     h = grp('MOVE','<b>WASD</b>/<b>Arrows</b>')
       + grp('LOOK','mouse / drag')
       + grp('PAINT GUN','<b>click</b> to fire')
+      + grp('WHISTLE', whistleOn ? '<b>Q</b> on' : '<b>Q</b> off')
       + grp('UNSTICK','<b>T</b>');
   } else if(p.caught){
     h = grp('SPECTATE','<b>WASD</b>/<b>Arrows</b> fly · drag look');
@@ -3948,11 +3957,11 @@ function updateListener(){
    that speeds up and gets louder the closer the nearest hider is. Purely local
    (the seeker's client already knows every hider's position during the hunt);
    hiders never hear it. */
-let whistleNext = 0;
+let whistleNext = 0, whistleOn = false;      // manual toggle — OFF by default; the seeker turns it on with Q / the button
 const WHISTLE_RANGE = 22;
 function updateSeekerWhistle(t){
   const p = me();
-  if(!AC || !p || p.role!=='seeker' || p.caught || G.phase!=='hunt') return;
+  if(!whistleOn || !AC || !p || p.role!=='seeker' || p.caught || G.phase!=='hunt') return;
   let best = Infinity;
   for(const id in G.players){
     const q = G.players[id];
@@ -3967,6 +3976,14 @@ function updateSeekerWhistle(t){
   const g = lerp(0.34, 0.05, t01), f = lerp(1750, 1050, t01);
   blip(f, 0.085, 'sine', g);
   blip(f*1.18, 0.06, 'sine', g*0.7, 0.05);                // quick up-chirp = a "whistle"
+}
+function toggleWhistle(){
+  const p = me(); if(!p || p.role!=='seeker') return;    // only the seeker hears it, so only the seeker toggles it
+  whistleOn = !whistleOn;
+  const b = $('btnWhistle');
+  if(b){ b.textContent = whistleOn ? '🔊 Whistle: ON' : '🔈 Whistle: OFF'; b.style.borderColor = whistleOn ? 'var(--lime)' : ''; }
+  toast(whistleOn ? '🔊 Proximity whistle ON — chirps get faster as you near a hider' : '🔈 Whistle off');
+  updateHints();
 }
 
 /* =====================================================================
@@ -3984,6 +4001,8 @@ function updateHud(){
     const cd = ME.shotCd - now();
     $('shotCd').textContent = cd>0 ? 'RELOADING '+cd.toFixed(1) : '';
   } else $('shotCd').textContent='';
+  const bw = $('btnWhistle');
+  if(bw) bw.style.display = (p && p.role==='seeker' && !p.caught && G.phase==='hunt') ? 'block' : 'none';   // seeker-only control
 }
 
 /* =====================================================================
