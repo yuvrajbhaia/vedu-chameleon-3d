@@ -251,6 +251,8 @@ select{width:100%; background:#0d1219; color:var(--ink); border:1px solid var(--
         <select id="setMode"><option value="classic" selected>Classic</option><option value="infection">Infection</option></select></div>
       <div><label class="fld">Speed</label>
         <select id="setSpeed"><option value="0.7">0.7x</option><option value="0.85">0.85x</option><option value="1" selected>1x</option><option value="1.25">1.25x</option><option value="1.5">1.5x</option><option value="1.75">1.75x</option><option value="2">2x</option></select></div>
+      <div><label class="fld">Seekers</label>
+        <select id="setSeekers"><option value="0" selected>Auto</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option></select></div>
     </div>
     <button class="btn primary" id="btnStart">START ROUND</button>
     <button class="btn ghost" id="btnLeaveLobby">Leave</button>
@@ -263,6 +265,8 @@ select{width:100%; background:#0d1219; color:var(--ink); border:1px solid var(--
   <div id="phaseBar"><div id="phaseName">PREP</div><div id="phaseTime">1:15</div></div>
   <button id="roomChip" class="copyable" title="Click to copy">ROOM <b id="roomChipCode">·····</b><span class="copyIcon">⧉</span></button>
   <div id="aliveChip">🦎 <span id="aliveN">0</span> hidden</div>
+  <canvas id="minimap" width="150" height="218" class="hidden" style="position:fixed;left:12px;bottom:12px;z-index:40;border:1px solid rgba(255,255,255,.22);border-radius:8px;pointer-events:none;"></canvas>
+  <button id="btnUnstick" class="btn mini" style="position:fixed;right:12px;bottom:12px;z-index:41;pointer-events:auto;" title="Force-unstick (T)">↻ Unstick</button>
   <div id="roleBanner" class="hider">YOU ARE A HIDER</div>
   <div id="xhair" class="hidden"></div>
   <div id="shotCd"></div>
@@ -296,6 +300,8 @@ select{width:100%; background:#0d1219; color:var(--ink); border:1px solid var(--
       <input type="range" id="pbSize" min="2" max="20" value="6">
       <span class="pbl" id="pbSizeVal">6cm</span>
     </div>
+    <button class="btn mini" id="pbUndo" disabled>↶ Undo</button>
+    <button class="btn mini" id="pbRedo" disabled>↷ Redo</button>
     <button class="btn mini" id="pbEraser">Eraser</button>
     <button class="btn mini" id="pbClear">Clear</button>
     <button class="btn mini teal" id="pbDone">Done (F)</button>
@@ -390,6 +396,7 @@ const G = {
   winner:'', revealList:[],
   paintMode:false, poseOpen:false,
 };
+let hiderView = 'body';   // local-only: 'body' | 'roam' (freeze+free-fly) | 'seekcam' (mirror seeker POV)
 function me(){ return G.players[G.myId]; }
 
 function newPlayer(id,name){
@@ -2403,6 +2410,7 @@ function ensurePlayerVisual(p){
   p.obj=c.root; p.joints=c.joints; p.mat=c.mat;
   p.paintCanvas=c.paintCanvas; p.paintTex=c.paintTex; p.bodyMeshes=c.bodyMeshes;
   p.paintData = null;
+  if(p.id===G.myId){ undoStack=[]; redoStack=[]; updateUndoRedoUI(); }   // fresh body → fresh undo history
   p.obj.position.set(p.x,p.y,p.z);
   p.label = makeNameLabel(p.name, p.accent); p.labelName = p.name;
   scene.add(p.label);
@@ -2473,6 +2481,9 @@ let brush = { color:'#2e8f83', size:6, erase:false };   // size = diameter in CM
 let mySwatches = [];
 let lastDabN = null, lastDabT = 0, lastCur = {x:0,y:0}, lastCurPx = {x:innerWidth/2, y:innerHeight/2};
 let pbPainting = false, pbOrbit = false, pbLast = null, eyedropArmed = false;
+/* ---------------- paint undo/redo (per-stroke, my own canvas only) ---------------- */
+const UNDO_MAX = 12;
+let undoStack = [], redoStack = [], strokeSnap = null;
 let paintZoom = 2.9;
 const _pv2 = new THREE.Vector2();
 const _center = new THREE.Vector2(0,0);
@@ -2609,7 +2620,8 @@ c3dEl.addEventListener('pointerdown', e=>{
   if(e.button!==0) return;
   if(eyedropArmed){ sampleScreenColor(e.clientX, e.clientY); setEyedrop(false); return; }
   const n = evNDC(e); lastDabN = null;
-  if(paintAtNDC(n.x, n.y, false)){ pbPainting = true; }
+  strokeSnap = snapshotPaint();   // pre-stroke state; only pushed to undo if this stroke actually paints
+  if(paintAtNDC(n.x, n.y, false)){ pbPainting = true; pushUndo(strokeSnap); }
   else { pbOrbit = true; pbLast = {x:e.clientX, y:e.clientY}; }
 });
 c3dEl.addEventListener('contextmenu', e=>{ if(G.paintMode) e.preventDefault(); });
@@ -2738,9 +2750,48 @@ function renderSwatches(){
 }
 function clearMyPaint(){
   const p = me(); if(!p||!p.paintCanvas) return;
+  pushUndo(snapshotPaint());
   paintBase(p.paintCanvas.getContext('2d'));
   p.paintData = null;
   p.paintTex.needsUpdate = true; schedulePaintSync();
+}
+function snapshotPaint(){
+  const p = me(); if(!p||!p.paintCanvas) return null;
+  return p.paintCanvas.getContext('2d').getImageData(0,0,PAINT_N,PAINT_N);
+}
+function pushUndo(snap){
+  if(!snap) return;
+  undoStack.push(snap);
+  if(undoStack.length>UNDO_MAX) undoStack.shift();
+  redoStack.length = 0;
+  updateUndoRedoUI();
+}
+function undoPaint(){
+  const p = me(); if(!p||!p.paintCanvas || !undoStack.length) return;
+  const cur = snapshotPaint();
+  redoStack.push(cur);
+  if(redoStack.length>UNDO_MAX) redoStack.shift();
+  const prev = undoStack.pop();
+  p.paintCanvas.getContext('2d').putImageData(prev,0,0);
+  p.paintData = null;
+  p.paintTex.needsUpdate = true; schedulePaintSync();
+  updateUndoRedoUI();
+}
+function redoPaint(){
+  const p = me(); if(!p||!p.paintCanvas || !redoStack.length) return;
+  const cur = snapshotPaint();
+  undoStack.push(cur);
+  if(undoStack.length>UNDO_MAX) undoStack.shift();
+  const next = redoStack.pop();
+  p.paintCanvas.getContext('2d').putImageData(next,0,0);
+  p.paintData = null;
+  p.paintTex.needsUpdate = true; schedulePaintSync();
+  updateUndoRedoUI();
+}
+function updateUndoRedoUI(){
+  const ub = $('pbUndo'), rb = $('pbRedo');
+  if(ub) ub.disabled = !undoStack.length;
+  if(rb) rb.disabled = !redoStack.length;
 }
 let paintSyncT = 0;
 function schedulePaintSync(){ clearTimeout(paintSyncT); paintSyncT = setTimeout(sendPaint, 400); }
@@ -2824,6 +2875,8 @@ function closePaintMode(){
 }
 $('pbDone').onclick = closePaintMode;
 $('pbClear').onclick = clearMyPaint;
+$('pbUndo').onclick = undoPaint;
+$('pbRedo').onclick = redoPaint;
 $('pbEyedrop').onclick = ()=> setEyedrop(!eyedropArmed);
 $('pbEraser').onclick = ()=>{ brush.erase=!brush.erase; $('pbEraser').style.borderColor = brush.erase?'var(--lime)':''; };
 $('pbSize').oninput = e=>{ brush.size = +e.target.value; $('pbSizeVal').textContent = e.target.value+'cm'; };
@@ -2867,9 +2920,15 @@ addEventListener('keydown', e=>{
   const k = e.key.toLowerCase();
   keys[k] = true;
   if(G.screen!=='play') return;
-  if(k==='f') togglePaintMode();
+  if(k.indexOf('arrow')===0) e.preventDefault();              // arrows move — don't let them scroll the page
+  if(k==='f'){ if(hiderView==='body') togglePaintMode(); }    // no painting while frozen/roaming
   if(k==='r'){ G.poseOpen ? closePoseWheel() : openPoseWheel(); }
   if(k==='e'){ if(canPaint()) sampleScreenColor(lastCurPx.x, lastCurPx.y); }   // exact colour under cursor, anytime
+  if(k==='v') toggleFreeze();                                 // freeze self + roam / unfreeze
+  if(k==='b') toggleSeekerCam();                              // while frozen: mirror the seeker's view
+  if(k==='t') forceUnstick();                                 // panic escape hatch (any role)
+  if(G.paintMode && k==='z' && (e.ctrlKey||e.metaKey)){ e.preventDefault(); e.shiftKey ? redoPaint() : undoPaint(); }
+  if(G.paintMode && k==='y' && (e.ctrlKey||e.metaKey)){ e.preventDefault(); redoPaint(); }
 });
 addEventListener('keyup', e=>{ keys[e.key.toLowerCase()] = false; });
 addEventListener('blur', ()=>{ for(const k in keys) keys[k]=false; });   // no runaway movement
@@ -2880,31 +2939,44 @@ canvas3d.addEventListener('pointerdown', e=>{
   audioInit();
   if(G.screen!=='play') return;
   const mode = moveMode();
-  if(mode==='walk'){                       // seeker: lock pointer, then click = shoot
-    if(document.pointerLockElement!==canvas3d) canvas3d.requestPointerLock();
-    else if(e.button===0) tryShoot();
+  if(mode==='walk'){                       // seeker
+    if(document.pointerLockElement===canvas3d){
+      if(e.button===0) tryShoot();         // pointer locked: left-click fires
+    }else{
+      canvas3d.requestPointerLock();       // try to (re)grab the mouse, AND...
+      if(e.button===0) lookDrag = {x:e.clientX, y:e.clientY, moved:false, shoot:true};
+      // ...allow drag-to-look + click-to-fire meanwhile, so a failed/denied pointer
+      // lock never leaves the seeker unable to turn (the old "seeker can't move" bug)
+    }
     return;
   }
   if(G.paintMode || G.poseOpen) return;    // paint mode owns its drags (see p4)
-  if((mode==='hider' || mode==='spectate') && e.button===0) lookDrag = {x:e.clientX, y:e.clientY};
+  if((mode==='hider' || mode==='spectate' || mode==='roam') && e.button===0) lookDrag = {x:e.clientX, y:e.clientY, moved:false};
 });
-addEventListener('pointerup', ()=>{ lookDrag = null; });
+addEventListener('pointerup', ()=>{
+  if(lookDrag && lookDrag.shoot && !lookDrag.moved && moveMode()==='walk') tryShoot();  // a click (no drag) in fallback mode = fire
+  lookDrag = null;
+});
 addEventListener('mousemove', e=>{
-  if(document.pointerLockElement===canvas3d){       // seeker FPS
+  if(document.pointerLockElement===canvas3d){       // seeker FPS (pointer locked)
     ME.yaw   -= e.movementX*0.0023;
     ME.pitch  = clamp(ME.pitch - e.movementY*0.0023, -1.35, 1.35);
     return;
   }
-  if(lookDrag && !G.paintMode){                      // hider/spectator drag look
-    ME.yaw   -= (e.clientX-lookDrag.x)*0.006;
-    ME.pitch  = clamp(ME.pitch-(e.clientY-lookDrag.y)*0.006, -1.3, 1.3);
-    lookDrag = {x:e.clientX, y:e.clientY};
+  if(lookDrag && !G.paintMode){                      // drag-look: hider / spectator / roam / seeker-fallback
+    const ddx=e.clientX-lookDrag.x, ddy=e.clientY-lookDrag.y;
+    if(Math.abs(ddx)+Math.abs(ddy) > 3) lookDrag.moved = true;
+    ME.yaw   -= ddx*0.006;
+    ME.pitch  = clamp(ME.pitch-ddy*0.006, -1.3, 1.3);
+    lookDrag.x=e.clientX; lookDrag.y=e.clientY;
   }
 });
 
 function moveMode(){
   const p = me(); if(!p) return 'none';
   if(G.phase==='reveal') return 'tour';
+  const aliveHider = (p.role==='hider' && !p.caught && (G.phase==='prep' || G.phase==='hunt'));
+  if(aliveHider && hiderView!=='body') return hiderView;   // self-frozen: 'roam' or 'seekcam'
   if(G.phase==='prep'){
     if(p.role==='seeker') return 'locked';           // blacked out in spawn
     return 'hider';                                  // fly + paint
@@ -2932,15 +3004,18 @@ function moveWalk(dt){   // grounded movement with collision — seeker FPS, or 
   const p = me();
   const speed = (p.role==='seeker' ? SEEKER_SPEED : HIDER_SPEED) * (keys['shift']?1.35:1) * (G.speedMult||1);
   let fx=0, fz=0;
-  if(keys['w']) fz-=1; if(keys['s']) fz+=1;
-  if(keys['a']) fx-=1; if(keys['d']) fx+=1;
+  if(keys['w']||keys['arrowup']) fz-=1; if(keys['s']||keys['arrowdown']) fz+=1;
+  if(keys['a']||keys['arrowleft']) fx-=1; if(keys['d']||keys['arrowright']) fx+=1;
   const len = Math.hypot(fx,fz)||1;
   const sin=Math.sin(ME.yaw), cos=Math.cos(ME.yaw);
   const dx = (fx*cos + fz*sin)/len * speed * dt;
   const dz = (-fx*sin + fz*cos)/len * speed * dt;
   p._walk = !!(fx||fz);
-  if((fx||fz) && dx && !collides(ME.pos.x+dx, ME.pos.y+0.05, ME.pos.z)) ME.pos.x += dx;
-  if((fx||fz) && dz && !collides(ME.pos.x, ME.pos.y+0.05, ME.pos.z+dz)) ME.pos.z += dz;
+  // if already overlapping a collider (spawned/pushed into one), don't block movement —
+  // otherwise every candidate cell also collides and the seeker is frozen in place ("can't move")
+  const stuck = !!collides(ME.pos.x, ME.pos.y+0.05, ME.pos.z);
+  if((fx||fz) && dx && (stuck || !collides(ME.pos.x+dx, ME.pos.y+0.05, ME.pos.z))) ME.pos.x += dx;
+  if((fx||fz) && dz && (stuck || !collides(ME.pos.x, ME.pos.y+0.05, ME.pos.z+dz))) ME.pos.z += dz;
   if(keys[' '] && ME.onGround){ ME.vel.y = JUMP_V; ME.onGround=false; }
   ME.vel.y -= GRAV*dt;
   let ny = ME.pos.y + ME.vel.y*dt;
@@ -2979,13 +3054,24 @@ function moveHiderClimb(dt){
   const p = me();
   const sp = HIDER_SPEED * (G.speedMult||1) * dt;
   let fx=0, fz=0;
-  if(keys['w']) fz-=1; if(keys['s']) fz+=1;
-  if(keys['a']) fx-=1; if(keys['d']) fx+=1;
+  if(keys['w']||keys['arrowup']) fz-=1; if(keys['s']||keys['arrowdown']) fz+=1;
+  if(keys['a']||keys['arrowleft']) fx-=1; if(keys['d']||keys['arrowright']) fx+=1;
   const moving = !!(fx||fz);
   if(moving){
     const len=Math.hypot(fx,fz), sin=Math.sin(ME.yaw), cos=Math.cos(ME.yaw);
-    ME.pos.x += (fx*cos + fz*sin)/len * sp;
-    ME.pos.z += (-fx*sin + fz*cos)/len * sp;
+    const mvx = (fx*cos + fz*sin)/len * sp;
+    const mvz = (-fx*sin + fz*cos)/len * sp;
+    // Substep the horizontal move, resolving after each step: a fast step or a thin
+    // frame/wall must never let the body leap fully past a collider in one frame —
+    // that dodges the embed test entirely and phases you through. 0.06 < the thinnest
+    // collider (gold frames are 0.14 deep) so every crossing is caught mid-step.
+    const dist = Math.hypot(mvx, mvz);
+    const n = Math.max(1, Math.ceil(dist / 0.06));
+    for(let i=0;i<n;i++){
+      ME._prevX = ME.pos.x; ME._prevZ = ME.pos.z;
+      ME.pos.x += mvx/n; ME.pos.z += mvz/n;
+      resolveEmbed();
+    }
   }
   const onWall = touchingWall();
   if(keys[' ']){
@@ -3012,6 +3098,7 @@ function moveHiderClimb(dt){
     ME.pos.y = ny;
   }
   p._walk = moving;
+  ME._prevX = ME.pos.x; ME._prevZ = ME.pos.z;   // vertical settle only — no horizontal entry bias
   resolveEmbed();
   ME.pos.x = clamp(ME.pos.x, -MAP.w/2, MAP.w/2);
   ME.pos.z = clamp(ME.pos.z, -MAP.d/2, MAP.d/2);
@@ -3031,10 +3118,13 @@ const _embQ = new THREE.Quaternion(), _embE = new THREE.Euler(0,0,0,'YXZ'), _emb
 function resolveEmbed(){
   const p = me(); const P = POSES[p.pose] || POSES.stand;
   _embE.set(P.rx, ME.yaw + Math.PI, P.rz); _embQ.setFromEuler(_embE);
+  const hasPrev = (ME._prevX !== undefined), EPS = 0.0015;
   for(let pass=0; pass<2; pass++){
     for(const ly of EMBED_SPINE){
       _embV.set(0, ly, 0).applyQuaternion(_embQ);
       const cx_ = ME.pos.x + _embV.x, cz = ME.pos.z + _embV.z, cy = ME.pos.y + P.dy + _embV.y;
+      const pcx = (hasPrev ? ME._prevX : ME.pos.x) + _embV.x;   // where this point was last (sub)step
+      const pcz = (hasPrev ? ME._prevZ : ME.pos.z) + _embV.z;
       for(const c of colliders){
         // skip the world-bounding floor/ceiling shell — it spans the whole map, not an
         // obstacle, and ground clamping (elsewhere) already keeps the root on/above it.
@@ -3042,10 +3132,24 @@ function resolveEmbed(){
         // shoved back up by this same loop mistaking the floor for something to escape.
         if(c.max.x-c.min.x >= MAP.w-2 && c.max.z-c.min.z >= MAP.d-2) continue;
         if(cx_>c.min.x && cx_<c.max.x && cz>c.min.z && cz<c.max.z && cy>c.min.y && cy<c.max.y){
+          // DIRECTIONAL escape: push back to the face the body CAME FROM — never the
+          // far side. Pushing to the geometrically-nearest face (the old behaviour) pops
+          // you out the OTHER side once your centre crosses the midplane, which is exactly
+          // how hiders phased fully through a wall/frame. 50% lean-in is untouched: when
+          // you already rest against the near face, that face IS the entry side, so you
+          // stay put. Exit via the shallowest entry face — that alone clears the AABB.
+          const fromXmin = pcx <= c.min.x + EPS, fromXmax = pcx >= c.max.x - EPS;
+          const fromZmin = pcz <= c.min.z + EPS, fromZmax = pcz >= c.max.z - EPS;
+          let best = Infinity, ax = 0, val = 0;
+          if(fromXmin && (cx_-c.min.x) < best){ best = cx_-c.min.x; ax=1; val=c.min.x-_embV.x; }
+          if(fromXmax && (c.max.x-cx_) < best){ best = c.max.x-cx_; ax=1; val=c.max.x-_embV.x; }
+          if(fromZmin && (cz-c.min.z) < best){ best = cz-c.min.z; ax=2; val=c.min.z-_embV.z; }
+          if(fromZmax && (c.max.z-cz) < best){ best = c.max.z-cz; ax=2; val=c.max.z-_embV.z; }
+          if(ax===1){ ME.pos.x = val; continue; }
+          if(ax===2){ ME.pos.z = val; continue; }
+          // No horizontal entry side (came from above/below, or the pose just changed):
+          // fall back to nearest-of-all-faces, keeping the floor/ceiling guards below.
           const dxl=cx_-c.min.x, dxr=c.max.x-cx_, dzl=cz-c.min.z, dzr=c.max.z-cz;
-          // vertical escape only counts if it doesn't require going through the floor/ceiling —
-          // a ground-level box sits right where a low sample point already is, so "push down"
-          // can look like the cheapest margin while actually being a no-op against the floor.
           const newYDown = c.min.y-P.dy-_embV.y, newYUp = c.max.y-P.dy-_embV.y;
           const dyb = newYDown>=0 ? cy-c.min.y : Infinity;
           const dyt = newYUp<=MAP.h-0.3 ? c.max.y-cy : Infinity;
@@ -3062,15 +3166,89 @@ function moveFreecam(dt){   // caught spectator
   const sp = FREECAM_SPEED*dt;
   const cy=Math.cos(ME.yaw), sy=Math.sin(ME.yaw), cp=Math.cos(ME.pitch), sp2=Math.sin(ME.pitch);
   const fwd = new THREE.Vector3(-sy*cp, sp2, -cy*cp), right = new THREE.Vector3(cy,0,-sy);
-  if(keys['w']) ME.cam.addScaledVector(fwd, sp);
-  if(keys['s']) ME.cam.addScaledVector(fwd,-sp);
-  if(keys['a']) ME.cam.addScaledVector(right,-sp);
-  if(keys['d']) ME.cam.addScaledVector(right, sp);
+  if(keys['w']||keys['arrowup']) ME.cam.addScaledVector(fwd, sp);
+  if(keys['s']||keys['arrowdown']) ME.cam.addScaledVector(fwd,-sp);
+  if(keys['a']||keys['arrowleft']) ME.cam.addScaledVector(right,-sp);
+  if(keys['d']||keys['arrowright']) ME.cam.addScaledVector(right, sp);
   if(keys[' ']) ME.cam.y += sp;
   if(keys['shift']) ME.cam.y -= sp;
   ME.cam.x = clamp(ME.cam.x, -MAP.w/2+0.5, MAP.w/2-0.5);
   ME.cam.y = clamp(ME.cam.y, 0.4, MAP.h-0.4);
   ME.cam.z = clamp(ME.cam.z, -MAP.d/2+0.5, MAP.d/2-0.5);
+}
+
+/* ---------------- freeze / roam / seeker-view (alive hider self-spectate) ---------------- */
+function firstSeeker(){ for(const id in G.players){ const q=G.players[id]; if(q && q.role==='seeker' && !q.caught) return q; } return null; }
+function toggleFreeze(){
+  const p = me(); if(!p || p.role!=='hider' || p.caught) return;
+  if(hiderView==='body'){
+    if(G.paintMode) closePaintMode();
+    ME.cam.copy(camera.position);          // roam starts from the current view, no jump
+    hiderView = 'roam';
+    toast('❄️ Frozen — roam free · <b>V</b> unfreeze · <b>B</b> seeker view');
+  }else{
+    hiderView = 'body';
+    toast('▶️ Unfrozen — back on your body');
+  }
+  updateHints();
+}
+function toggleSeekerCam(){
+  const p = me(); if(!p || p.role!=='hider' || p.caught || hiderView==='body') return;  // only while frozen
+  if(hiderView==='seekcam'){ hiderView='roam'; toast('🕊️ Roam view'); }
+  else if(firstSeeker()){ hiderView='seekcam'; toast('👁️ Seeker view'); }
+  else toast('No active seeker to view');
+  updateHints();
+}
+/* ---------------- force-unstick (any role — the "seeker can't move" escape hatch) ---------------- */
+function findClearSpot(x, z){
+  for(let r=0; r<=9; r+=0.5){
+    for(let a=0; a<Math.PI*2-0.001; a+=Math.PI/8){
+      const tx = clamp(x + Math.cos(a)*r, -MAP.w/2+0.6, MAP.w/2-0.6);
+      const tz = clamp(z + Math.sin(a)*r, -MAP.d/2+0.6, MAP.d/2-0.6);
+      if(!collides(tx, 0.05, tz)) return {x:tx, z:tz};
+      if(r===0) break;   // r=0 is a single point
+    }
+  }
+  return {x, z};
+}
+function forceUnstick(){
+  const p = me(); if(!p) return;
+  for(const k in keys) keys[k] = false;          // drop any keys stuck 'on'
+  ME.vel.set(0,0,0); ME.onGround = false;
+  hiderView = 'body';                            // leave any freeze/roam
+  const spot = findClearSpot(ME.pos.x, ME.pos.z);   // pop out where you are, not across the map
+  ME.pos.set(spot.x, 0, spot.z);
+  ME.pitch = -0.05;
+  if(p.role==='seeker' && document.pointerLockElement!==canvas3d){ try{ canvas3d.requestPointerLock(); }catch(e){} }
+  try{ window.focus(); }catch(e){}
+  toast('↻ Unstuck');
+}
+/* ---------------- minimap (spectator / roam tool only) ---------------- */
+function updateMinimap(){
+  const cv = $('minimap'); if(!cv) return;
+  const p = me();
+  const show = !!(p && (hiderView==='roam' || hiderView==='seekcam' || p.caught));
+  cv.classList.toggle('hidden', !show);
+  if(!show) return;
+  const cx = cv.getContext('2d'), W=cv.width, H=cv.height;
+  const X0=-MAP.w/2, Z0=-MAP.d/2, sx=W/MAP.w, sz=H/MAP.d;
+  cx.clearRect(0,0,W,H);
+  cx.fillStyle='rgba(18,22,30,0.92)'; cx.fillRect(0,0,W,H);
+  cx.fillStyle='rgba(150,162,185,0.5)';                 // walls
+  for(const c of colliders){
+    const w=c.max.x-c.min.x, d=c.max.z-c.min.z, h=c.max.y-c.min.y;
+    if(h<1.2) continue;                                  // tall obstacles only
+    if(w>=MAP.w-2 && d>=MAP.d-2) continue;               // skip the world shell
+    cx.fillRect((c.min.x-X0)*sx, (c.min.z-Z0)*sz, Math.max(1,w*sx), Math.max(1,d*sz));
+  }
+  for(const id in G.players){                            // player dots (spectator view → showing all is intended)
+    const q=G.players[id]; if(!q) continue;
+    const dx=(q.x-X0)*sx, dz=(q.z-Z0)*sz, self=id===G.myId;
+    cx.beginPath(); cx.arc(dx, dz, self?4:3, 0, 7);
+    cx.fillStyle = q.caught ? '#8a94a6' : (q.role==='seeker' ? '#ff4d6d' : '#3ee6c4');
+    cx.fill();
+    if(self){ cx.lineWidth=2; cx.strokeStyle='#fff'; cx.stroke(); }
+  }
 }
 
 /* ---------------- seeker paint gun ---------------- */
@@ -3114,7 +3292,9 @@ function hostStartRound(){
   G.round++;
   const ids = Object.keys(G.players);
   const n = ids.length;
-  const nSeek = n>=6 ? 2 : 1;
+  const chosen = $('setSeekers') ? +$('setSeekers').value : 0;   // 0 = Auto
+  // at least 1 seeker, and always leave at least 1 hider
+  const nSeek = Math.max(1, Math.min(Math.max(1, n-1), chosen>0 ? chosen : (n>=6 ? 2 : 1)));
   const seekSet = new Set();
   for(let i=0;i<nSeek;i++) seekSet.add(ids[((G.round-1)*nSeek + i) % n]);
   G.roundHiders = [];
@@ -3616,25 +3796,30 @@ function updateHints(){
   const p = me(); if(!p){ $('hints').innerHTML=''; return; }
   let h = '';
   const hider = p.role==='hider' && !p.caught;
-  if(hider && G.paintMode){
+  if(hider && (hiderView==='roam' || hiderView==='seekcam')){
+    h = grp('ROAM','<b>WASD</b>/<b>Arrows</b> fly · drag look')
+      + grp('SEEKER VIEW', hiderView==='seekcam' ? '<b>B</b> back to roam' : '<b>B</b>')
+      + grp('UNFREEZE','<b>V</b>');
+  } else if(hider && G.paintMode){
     h = grp('PAINT','drag on your body')
       + grp('ORBIT VIEW','drag empty space')
       + grp('COLOUR','full palette · <b>E</b> = exact colour under cursor')
       + grp('DONE','<b>F</b>');
   } else if(hider){
-    h = grp('MOVE','<b>WASD</b>')
+    h = grp('MOVE','<b>WASD</b>/<b>Arrows</b>')
       + grp('JUMP','<b>Space</b>')
       + grp('CLIMB','<b>Space</b>/<b>Shift</b> at a wall')
-      + grp('LOOK','drag mouse')
-      + grp('EYEDROP','<b>E</b>')
       + grp('PAINT','<b>F</b>')
-      + grp('POSE','<b>R</b>');
+      + grp('POSE','<b>R</b>')
+      + grp('FREEZE+ROAM','<b>V</b>')
+      + grp('UNSTICK','<b>T</b>');
   } else if(p.role==='seeker' && !p.caught && G.phase==='hunt'){
-    h = grp('MOVE','<b>WASD</b>')
-      + grp('LOOK','mouse')
-      + grp('PAINT GUN','<b>click</b> to fire');
+    h = grp('MOVE','<b>WASD</b>/<b>Arrows</b>')
+      + grp('LOOK','mouse / drag')
+      + grp('PAINT GUN','<b>click</b> to fire')
+      + grp('UNSTICK','<b>T</b>');
   } else if(p.caught){
-    h = grp('SPECTATE','<b>WASD</b> fly · drag look');
+    h = grp('SPECTATE','<b>WASD</b>/<b>Arrows</b> fly · drag look');
   }
   $('hints').innerHTML = h;
   $('hints').style.display = h ? 'block':'none';
@@ -3683,9 +3868,19 @@ function updateCamera(mode){
     camera.rotation.set(ME.pitch, ME.yaw, 0);
     return;
   }
-  if(mode==='spectate'){                // caught free-fly
+  if(mode==='spectate' || mode==='roam'){   // caught free-fly, or an alive hider self-frozen and roaming
     camera.position.copy(ME.cam);
     camera.rotation.set(ME.pitch, ME.yaw, 0);
+    return;
+  }
+  if(mode==='seekcam'){                  // frozen hider mirroring the seeker's point of view
+    const s = firstSeeker();
+    if(s && s.obj){
+      camera.position.set(s.obj.position.x, s.obj.position.y+1.62, s.obj.position.z);
+      camera.rotation.set(-0.05, s.ry||0, 0);   // pitch isn't synced — sit roughly level
+    }else{
+      camera.position.copy(ME.cam); camera.rotation.set(ME.pitch, ME.yaw, 0);
+    }
     return;
   }
   if(mode==='locked'){                  // seeker blackout
@@ -3749,6 +3944,30 @@ function updateListener(){
     try{ L.setPosition(cp.x,cp.y,cp.z); L.setOrientation(fwd.x,fwd.y,fwd.z,0,1,0); }catch(e2){}
   }
 }
+/* SEEKER proximity whistle — a hot/cold cue for the seeker only: a whistle chirp
+   that speeds up and gets louder the closer the nearest hider is. Purely local
+   (the seeker's client already knows every hider's position during the hunt);
+   hiders never hear it. */
+let whistleNext = 0;
+const WHISTLE_RANGE = 22;
+function updateSeekerWhistle(t){
+  const p = me();
+  if(!AC || !p || p.role!=='seeker' || p.caught || G.phase!=='hunt') return;
+  let best = Infinity;
+  for(const id in G.players){
+    const q = G.players[id];
+    if(!q || q.id===G.myId || q.role!=='hider' || q.caught) continue;
+    const d = Math.hypot(q.x-ME.pos.x, (q.y||0)-ME.pos.y, q.z-ME.pos.z);
+    if(d<best) best=d;
+  }
+  if(best>WHISTLE_RANGE) return;                          // nobody in range → silence
+  if(t < whistleNext) return;
+  const t01 = clamp((best-1)/(WHISTLE_RANGE-1), 0, 1);    // 0 = right on them, 1 = edge of range
+  whistleNext = t + lerp(0.13, 1.25, t01);                // pings quicken as you close in
+  const g = lerp(0.34, 0.05, t01), f = lerp(1750, 1050, t01);
+  blip(f, 0.085, 'sine', g);
+  blip(f*1.18, 0.06, 'sine', g*0.7, 0.05);                // quick up-chirp = a "whistle"
+}
 
 /* =====================================================================
    HUD refresh
@@ -3779,13 +3998,15 @@ function step(t, dt){
     camera.lookAt(0,1.2,0);
   }else if(G.screen==='play' || G.screen==='board'){
     const p = me();
+    if(p && !(p.role==='hider' && !p.caught) && hiderView!=='body') hiderView='body';   // only an alive hider may self-freeze
     const mode = moveMode();
     if(p && !G.paintMode){                       // pose wheel is non-blocking now
       if(mode==='walk') moveWalk(dt);
       else if(mode==='hider') moveHiderClimb(dt);
-      else if(mode==='spectate') moveFreecam(dt);
+      else if(mode==='spectate' || mode==='roam') moveFreecam(dt);   // caught OR self-frozen hider fly the camera
+      // 'seekcam' → no local movement; camera mirrors the seeker (updateCamera)
     }
-    if(p && (mode==='walk' || mode==='hider')){
+    if(p && (mode==='walk' || mode==='hider')){   // body only follows input when NOT frozen (roam/seekcam leave it in place)
       p.x=ME.pos.x; p.y=ME.pos.y; p.z=ME.pos.z;
       // body faces travel direction; stays put while painting (cursor never turns it)
       if(!G.paintMode) p.ry=ME.yaw;
@@ -3804,6 +4025,8 @@ function step(t, dt){
     updateHud();
     updateTracers();
     updateListener();
+    updateSeekerWhistle(t);
+    updateMinimap();
   }
 }
 function frame(){
@@ -3870,6 +4093,7 @@ wireCopyButton($('roomChip'));
 $('btnCancelConn').onclick = ()=> connFail('');
 $('btnLeaveLobby').onclick = leaveToMenu;
 $('btnBoardLeave').onclick = leaveToMenu;
+$('btnUnstick').onclick = ()=>{ forceUnstick(); $('btnUnstick').blur(); };
 $('btnStart').onclick = ()=>{ if(G.isHost && Object.keys(G.players).length>=2) hostStartRound(); };
 $('btnNextRound').onclick = ()=>{ if(G.isHost) hostStartRound(); };
 // Space must never re-click a focused button (jump ≠ restart round)
