@@ -560,6 +560,7 @@ function hostAddPlayer(id, name){
   // joins allowed in the lobby AND between rounds (reveal/board); mid-round is busy
   if(G.phase!=='lobby' && G.phase!=='reveal'){ T.toOne(id,{t:'busy'}); return; }
   G.players[id] = newPlayer(id, name);
+  G.players[id].lastSeen = now();          // start the heartbeat clock
   ensurePlayerVisual(G.players[id]);
   T.toOne(id, {t:'welcome', you:id, room:G.room});
   broadcastLobby();
@@ -572,6 +573,16 @@ function hostAddPlayer(id, name){
       sm.getContext('2d').drawImage(q.paintCanvas,0,0,512,512);
       T.toOne(id, {t:'paint', id:pid, tex:sm.toDataURL('image/png'), metal:q.metal, rough:q.rough});
     }
+  }
+}
+function hostPruneGhosts(t){
+  // Drop players whose tab died without a clean 'leave'/'close' (PeerJS 'close' is unreliable).
+  // Without this, a ghost lingers in the roster and gets dealt into the NEXT round.
+  for(const id in G.players){
+    if(id===G.myId) continue;
+    const p = G.players[id];
+    if(p.lastSeen===undefined){ p.lastSeen = t; continue; }   // grace for a just-added player
+    if(t - p.lastSeen > GHOST_TIMEOUT) hostRemovePlayer(id);
   }
 }
 function hostRemovePlayer(id){
@@ -622,7 +633,9 @@ function clientHandle(m){
 }
 function hostHandle(id, m){
   const p = G.players[id]; if(!p) return;
+  p.lastSeen = now();                      // any message proves the client is still alive
   switch(m.t){
+    case 'ping': break;                    // heartbeat only — lastSeen already bumped
     case 'leave': hostRemovePlayer(id); break;
     case 'move': hostApplyMove(p, m); break;
     case 'paint':
@@ -762,6 +775,7 @@ function addBox(w,h,d, x,y,z, opt={}){
   const m = new THREE.Mesh(geo, mat);
   m.position.set(x,y,z);
   if(opt.ry) m.rotation.y = opt.ry;
+  if(opt.invisible) m.visible = false;   // keep the collider, hide the mesh (e.g. ceiling)
   m.castShadow = !opt.noShadow; m.receiveShadow = true;
   if(!opt.noSample) m.userData.sample = sample;
   m.userData.env = true;
@@ -931,7 +945,7 @@ function buildMap(){
   const HX = MAP.w/2, HZ = MAP.d/2, H = MAP.h;
   // floor + ceiling (whole building)
   addBox(MAP.w,0.4,MAP.d, 0,-0.2,0, {canvas:{w:256,h:256,draw:drawWood,repeat:[7,10]}, name:'floor'});
-  addBox(MAP.w,0.4,MAP.d, 0,H+0.2,0, {color:'#171b22', noShadow:true});
+  addBox(MAP.w,0.4,MAP.d, 0,H+0.2,0, {color:'#171b22', noShadow:true, invisible:true});
   // outer walls, one camo family each
   addBox(MAP.w,H,WALL, 0,H/2,-HZ-WALL/2, {canvas:{w:512,h:256,draw:drawBrick,repeat:[3,2]}, name:'nWall'});  // far north brick
   addBox(MAP.w,H,WALL, 0,H/2, HZ+WALL/2, {canvas:{w:512,h:256,draw:drawTiles,repeat:[3,2]}, name:'sWall'});  // far south teal
@@ -2398,7 +2412,7 @@ function buildMapCircus(){
   const HX=MAP.w/2, HZ=MAP.d/2, H=MAP.h;
   const wall=(draw,rep)=>({canvas:{w:256,h:256,draw, repeat:rep||[3,2]}});
   addBox(MAP.w,0.4,MAP.d, 0,-0.2,0, {canvas:{w:256,h:256,draw:drawSawdust,repeat:[8,12]}, name:'floor'});
-  addBox(MAP.w,0.4,MAP.d, 0,H+0.2,0, {canvas:{w:256,h:256,draw:drawStarCloth,repeat:[4,6]}, noShadow:true});
+  addBox(MAP.w,0.4,MAP.d, 0,H+0.2,0, {color:'#0b0e13', noShadow:true, invisible:true});
   // OUTER WALLS — every segment a different circus look
   addBox(MAP.w,H,WALL, 0,H/2,-HZ-WALL/2, wall(drawTentStripe,[11,2]));   // N behind big top
   addBox(22,H,WALL, -11,H/2, HZ+WALL/2, wall(drawStarCloth,[5,2]));      // S menagerie half
@@ -3424,7 +3438,12 @@ function moveHiderClimb(dt){
     ME.pos.y = ny;
   }
   p._walk = moving;
-  ME._prevX = ME.pos.x; ME._prevZ = ME.pos.z;   // vertical settle only — no horizontal entry bias
+  // NOTE: do NOT reset _prevX/_prevZ here. Keeping the last horizontal entry side lets
+  // resolveEmbed's directional escape still know which face the body came from while
+  // climbing (pure-vertical) — without it, a spine point inside a CORNER (two walls) has
+  // no entry bias, falls back to nearest-face, and gets shoved through to the far side
+  // (the "corners make me go full in" bug). During horizontal movement the substep loop
+  // above already refreshes _prevX/_prevZ every step, so this only affects vertical-only frames.
   resolveEmbed();
   ME.pos.x = clamp(ME.pos.x, -MAP.w/2, MAP.w/2);
   ME.pos.z = clamp(ME.pos.z, -MAP.d/2, MAP.d/2);
@@ -3445,7 +3464,7 @@ function resolveEmbed(){
   const p = me(); const P = POSES[p.pose] || POSES.stand;
   _embE.set(P.rx, ME.yaw + Math.PI, P.rz); _embQ.setFromEuler(_embE);
   const hasPrev = (ME._prevX !== undefined), EPS = 0.0015;
-  for(let pass=0; pass<2; pass++){
+  for(let pass=0; pass<3; pass++){   // 3 passes: a corner spine point sits inside 2 walls; needs ≥2 to clear both
     for(const ly of EMBED_SPINE){
       _embV.set(0, ly, 0).applyQuaternion(_embQ);
       const cx_ = ME.pos.x + _embV.x, cz = ME.pos.z + _embV.z, cy = ME.pos.y + P.dy + _embV.y;
@@ -3618,7 +3637,9 @@ function tryShoot(){
 /* =====================================================================
    HOST GAME LOGIC — rounds, phases, catches, whistles, scoring
    ===================================================================== */
-let lastStateSent = 0, lastMoveSent = 0;
+let lastStateSent = 0, lastMoveSent = 0, lastPingSent = 0;
+const PING_EVERY = 2.5;      // client heartbeat: send a keep-alive every 2.5s even when idle
+const GHOST_TIMEOUT = 10;    // host drops any player it hasn't heard from in 10s (dead tab / lost conn)
 
 function hostStartRound(){
   G.round++;
@@ -4084,6 +4105,11 @@ function onPhaseLocal(phase){
   const p = me(); if(!p) return;
   if(phase==='prep'){
     show('play');
+    // fresh round → wipe any lingering local sub-state from the previous game so nobody is
+    // stuck in a reveal camera / frozen-roam / seeker-cam / open paint panel next round
+    tour = null; hiderView = 'body'; whistleOn = false;
+    closePaintMode(); closePoseWheel();
+    $('revealBanner').classList.add('hidden');
     clearSplats();
     if(G.isHost){ ME.pos.set(p.x,p.y,p.z); ME.vel.set(0,0,0); }
     $('revealBanner').classList.add('hidden');
@@ -4340,6 +4366,12 @@ function updateHud(){
 let lastSimAt = now(), lastFrameAt = 0;
 function step(t, dt){
   lastSimAt = t;
+  // heartbeat — runs in EVERY screen so ghosts are pruned between rounds and in the lobby.
+  // Host prunes silent players; clients send a keep-alive even when idle (reveal/board).
+  if(T){
+    if(G.isHost) hostPruneGhosts(t);
+    else if(t-lastPingSent>PING_EVERY){ lastPingSent=t; try{ T.toHost({t:'ping'}); }catch(e){} }
+  }
   if(G.screen==='menu' || G.screen==='lobby' || G.screen==='connecting'){
     const a = t*0.10;
     camera.position.set(Math.cos(a)*17, 8, Math.sin(a)*17);
