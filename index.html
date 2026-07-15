@@ -270,6 +270,12 @@ select{width:100%; background:#0d1219; color:var(--ink); border:1px solid var(--
   <canvas id="minimap" width="150" height="218" class="hidden" style="position:fixed;left:12px;bottom:12px;z-index:40;border:1px solid rgba(255,255,255,.22);border-radius:8px;pointer-events:none;"></canvas>
   <button id="btnUnstick" class="btn mini" style="position:fixed;right:12px;bottom:12px;z-index:41;pointer-events:auto;" title="Force-unstick (T)">↻ Unstick</button>
   <button id="btnWhistle" class="btn mini" style="position:fixed;right:12px;bottom:52px;z-index:41;pointer-events:auto;display:none;" title="Toggle proximity whistle (Q)">🔈 Whistle: OFF</button>
+  <button id="btnFlash" class="btn mini" style="position:fixed;right:12px;bottom:92px;z-index:41;pointer-events:auto;display:none;" title="Toggle torch (F)">🔦 Torch: OFF</button>
+  <button id="btnEnterMap" class="btn primary" style="position:fixed;left:50%;transform:translateX(-50%);bottom:104px;z-index:43;pointer-events:auto;display:none;" title="Drop into the map (Enter)">ENTER THE MAP ▸</button>
+  <div id="boothNote" style="position:fixed;left:50%;transform:translateX(-50%);bottom:150px;z-index:43;display:none;
+       background:rgba(8,11,16,0.72);border:1px solid rgba(255,255,255,0.10);border-radius:9px;padding:7px 14px;
+       font-size:12px;font-weight:700;letter-spacing:0.4px;color:var(--lime);text-align:center;pointer-events:none;">
+    🎨 YOUR PRIVATE BOOTH — nobody can see you. Take your time.</div>
   <div id="roleBanner" class="hider">YOU ARE A HIDER</div>
   <div id="xhair" class="hidden"></div>
   <div id="shotCd"></div>
@@ -400,6 +406,11 @@ const G = {
   paintMode:false, poseOpen:false,
 };
 let hiderView = 'body';   // local-only: 'body' | 'roam' (freeze+free-fly) | 'seekcam' (mirror seeker POV)
+// Private paint booth: at the start of prep every hider is alone — you can't see anyone and
+// nobody can see you — so you can paint and take your time before you commit to a hiding
+// spot. You stay frozen until you hit ENTER THE MAP (or prep runs out and drops you in).
+// The seeker is blacked out during prep anyway; this hides you from the OTHER hiders.
+let boothMode = false;
 function me(){ return G.players[G.myId]; }
 
 function newPlayer(id,name){
@@ -558,6 +569,7 @@ function leaveToMenu(){
   clearWorldPlayers();            // remove meshes BEFORE emptying the roster
   clearSplats();
   G.players = {}; G.phase='lobby'; G.round=0;
+  boothMode = false; flashOn = false; hiderView = 'body';
   show('menu');
 }
 
@@ -653,6 +665,7 @@ function hostHandle(id, m){
   const p = G.players[id]; if(!p) return;
   switch(m.t){
     case 'leave': hostRemovePlayer(id); break;
+    case 'booth': p.booth = !!m.on; break;   // they're still painting in private / they've dropped in
     case 'move': hostApplyMove(p, m); break;
     case 'paint':
       p.metal=m.metal; p.rough=m.rough;
@@ -4130,7 +4143,11 @@ addEventListener('keydown', e=>{
   keys[k] = true;
   if(G.screen!=='play') return;
   if(k.indexOf('arrow')===0) e.preventDefault();              // arrows move — don't let them scroll the page
-  if(k==='f'){ if(hiderView==='body') togglePaintMode(); }    // no painting while frozen/roaming
+  if(k==='enter') enterMap();                                 // leave the paint booth, drop into the map
+  if(k==='f'){                                                // seekers can't paint, so F is their torch
+    if(canFlash()) toggleFlash();
+    else if(hiderView==='body') togglePaintMode();            // no painting while frozen/roaming
+  }
   if(k==='r'){ G.poseOpen ? closePoseWheel() : openPoseWheel(); }
   if(k==='e'){ if(canPaint()) sampleScreenColor(lastCurPx.x, lastCurPx.y); }   // exact colour under cursor, anytime
   if(k==='v') toggleFreeze();                                 // freeze self + roam / unfreeze
@@ -4186,6 +4203,7 @@ function moveMode(){
   const p = me(); if(!p) return 'none';
   if(G.phase==='reveal') return 'tour';
   const aliveHider = (p.role==='hider' && !p.caught && (G.phase==='prep' || G.phase==='hunt'));
+  if(aliveHider && boothMode) return 'booth';              // in the private paint booth — frozen
   if(aliveHider && hiderView!=='body') return hiderView;   // self-frozen: 'roam' or 'seekcam'
   if(G.phase==='prep'){
     if(p.role==='seeker') return 'locked';           // blacked out in spawn
@@ -4566,6 +4584,7 @@ function hostStartRound(){
     const p = G.players[id];
     p.caught=false; p.stuck=0; p.pose='stand'; p._walk=false; p.whistleAt=0;
     p.role = seekSet.has(id) ? 'seeker' : 'hider';
+    p.booth = (p.role==='hider');   // hiders start hidden in their booth; each client clears it on ENTER
     // The random scatter around a spawn point can land you inside the furniture (the
     // manor's rooms are dense), and a body that starts INSIDE a prop fights the collision
     // resolver every frame and can barely move. Nudge every spawn to the nearest free spot.
@@ -4673,7 +4692,8 @@ function buildSnapshot(){
     const p = G.players[id];
     ps[id] = {n:p.name, role:p.role, c:p.caught?1:0, s:p.score, k:p.catches,
               x:+p.x.toFixed(2), y:+p.y.toFixed(2), z:+p.z.toFixed(2),
-              ry:+p.ry.toFixed(2), pose:p.pose, st:p.stuck, sn:p.sn, wk:p._walk?1:0};
+              ry:+p.ry.toFixed(2), pose:p.pose, st:p.stuck, sn:p.sn, wk:p._walk?1:0,
+              bo:p.booth?1:0};
   }
   return {phase:G.phase, tr:+(G.tEnd-now()).toFixed(1), round:G.round, mode:G.mode, map:G.map, ps};
 }
@@ -4709,6 +4729,7 @@ function applySnapshot(s){
       p.interp.push({t:now(), x:r.x, y:r.y, z:r.z, ry:r.ry});
       if(p.interp.length>8) p.interp.shift();
       p.pose=r.pose; p.stuck=r.st; p.sn=r.sn||p.sn; p._walk=!!r.wk;
+      p.booth = !!r.bo;      // still in their booth → don't draw them (my own flag stays local)
     }
   }
   // drop players that vanished
@@ -5019,10 +5040,15 @@ function onPhaseLocal(phase){
     show('play');
     // fresh round → wipe any lingering local sub-state from the previous game so nobody is
     // stuck in a reveal camera / frozen-roam / seeker-cam / open paint panel next round
-    tour = null; hiderView = 'body'; whistleOn = false;
+    tour = null; hiderView = 'body'; whistleOn = false; flashOn = false;
     closePaintMode(); closePoseWheel();
     $('revealBanner').classList.add('hidden');
     clearSplats();
+    // Every hider starts alone in their private booth: paint and take as long as you like,
+    // then ENTER THE MAP. Seekers skip it (they're blacked out in spawn anyway).
+    boothMode = (p.role==='hider' && !p.caught);
+    sendBooth();
+    if(boothMode) openPaintMode();
     if(G.isHost){ ME.pos.set(p.x,p.y,p.z); ME.vel.set(0,0,0); }
     $('revealBanner').classList.add('hidden');
     $('roleBanner').textContent = p.role==='hider' ? 'YOU ARE A HIDER — paint yourself into the room' : 'YOU ARE A HUNTER';
@@ -5038,6 +5064,9 @@ function onPhaseLocal(phase){
   else if(phase==='hunt'){
     $('blackout').classList.add('hidden');
     closePoseWheel();
+    // Prep ran out — anyone still chilling in their booth gets dropped in where they stand.
+    if(boothMode){ boothMode = false; closePaintMode(); sendBooth();
+      toast('⏰ Time! You were dropped in where you spawned — MOVE.'); }
     if(p.role==='seeker' && !p.caught){
       closePaintMode();
       $('xhair').classList.remove('hidden'); $('xhair').classList.add('seek');
@@ -5070,7 +5099,12 @@ function updateHints(){
   const p = me(); if(!p){ $('hints').innerHTML=''; return; }
   let h = '';
   const hider = p.role==='hider' && !p.caught;
-  if(hider && (hiderView==='roam' || hiderView==='seekcam')){
+  if(hider && boothMode){
+    h = grp('PRIVATE BOOTH','nobody can see you — take your time')
+      + grp('PAINT','drag on your body')
+      + grp('ORBIT VIEW','drag empty space')
+      + grp('DROP IN','<b>Enter</b>');
+  } else if(hider && (hiderView==='roam' || hiderView==='seekcam')){
     h = grp('ROAM','<b>WASD</b>/<b>Arrows</b> fly · drag look')
       + grp('SEEKER VIEW', hiderView==='seekcam' ? '<b>B</b> back to roam' : '<b>B</b>')
       + grp('UNFREEZE','<b>V</b>');
@@ -5092,6 +5126,7 @@ function updateHints(){
       + grp('LOOK','mouse / drag')
       + grp('PAINT GUN','<b>click</b> to fire')
       + grp('WHISTLE', whistleOn ? '<b>Q</b> on' : '<b>Q</b> off')
+      + (G.map==='manor' ? grp('TORCH', flashOn ? '<b>F</b> on' : '<b>F</b> off') : '')
       + grp('UNSTICK','<b>T</b>');
   } else if(p.caught){
     h = grp('SPECTATE','<b>WASD</b>/<b>Arrows</b> fly · drag look');
@@ -5244,6 +5279,60 @@ function updateSeekerWhistle(t){
   blip(f, 0.085, 'sine', g);
   blip(f*1.18, 0.06, 'sine', g*0.7, 0.05);                // quick up-chirp = a "whistle"
 }
+/* ---------------- seeker torch (manor only — the other maps are already lit) ---------------- */
+let flashlight = null, flashTarget = null, flashOn = false;
+const _flashDir = new THREE.Vector3();
+function canFlash(){
+  const p = me();
+  return !!(p && p.role==='seeker' && !p.caught && G.phase==='hunt' && G.map==='manor');
+}
+// Built on first use, and parented to the SCENE (not worldGroup) so a map rebuild never
+// disposes it. Adding a light recompiles every material, so we pay that once, on demand.
+function ensureFlashlight(){
+  if(flashlight) return;
+  flashlight = new THREE.SpotLight(0xfff2d0, 0, 30, Math.PI/7.5, 0.4, 1.1);
+  flashTarget = new THREE.Object3D();
+  scene.add(flashlight); scene.add(flashTarget);
+  flashlight.target = flashTarget;
+}
+function updateFlashlight(){
+  const on = flashOn && canFlash();
+  if(!on){ if(flashlight) flashlight.intensity = 0; return; }
+  ensureFlashlight();
+  flashlight.intensity = 90;
+  flashlight.position.copy(camera.position);
+  _flashDir.set(0,0,-1).applyQuaternion(camera.quaternion);
+  flashTarget.position.copy(camera.position).addScaledVector(_flashDir, 10);
+  flashTarget.updateMatrixWorld();
+}
+
+/* ---------------- private paint booth ---------------- */
+// Tell everyone whether I'm still tucked away in my booth, so their clients know not to
+// draw me. Booth state is decided locally (only you know when you're happy with your
+// paint job); the host just relays the flag in its snapshots.
+function sendBooth(){
+  const p = me(); if(!p) return;
+  p.booth = boothMode;
+  if(!G.isHost && T) try{ T.toHost({t:'booth', on:boothMode?1:0}); }catch(e){}
+}
+function enterMap(){
+  if(!boothMode) return;
+  boothMode = false;
+  closePaintMode();
+  sendBooth();
+  const p = me();
+  $('roleBanner').textContent = 'YOU ARE A HIDER — find a spot and blend in';
+  toast('🚪 You\'re in. Run, climb into something, and hold still — repaint any time with F.');
+  updateHints();
+}
+function toggleFlash(){
+  if(!canFlash()) return;
+  flashOn = !flashOn;
+  const b = $('btnFlash');
+  if(b){ b.textContent = flashOn ? '🔦 Torch: ON' : '🔦 Torch: OFF'; b.style.borderColor = flashOn ? 'var(--lime)' : ''; }
+  toast(flashOn ? '🔦 Torch on — sweep it across the dark' : '🔦 Torch off');
+  updateHints();
+}
 function toggleWhistle(){
   const p = me(); if(!p || p.role!=='seeker') return;    // only the seeker hears it, so only the seeker toggles it
   whistleOn = !whistleOn;
@@ -5270,6 +5359,11 @@ function updateHud(){
   } else $('shotCd').textContent='';
   const bw = $('btnWhistle');
   if(bw) bw.style.display = (p && p.role==='seeker' && !p.caught && G.phase==='hunt') ? 'block' : 'none';   // seeker-only control
+  const bf = $('btnFlash');
+  if(bf) bf.style.display = canFlash() ? 'block' : 'none';        // manor + seeker + hunt only
+  const be = $('btnEnterMap'), bn = $('boothNote');
+  if(be) be.style.display = boothMode ? 'block' : 'none';
+  if(bn) bn.style.display = boothMode ? 'block' : 'none';
 }
 
 /* =====================================================================
@@ -5307,7 +5401,13 @@ function step(t, dt){
     }
     if(G.isHost && T && G.phase!=='lobby'){ hostTick(); broadcastState(); }
     updateRemotes();
-    for(const id in G.players){ ensurePlayerVisual(G.players[id]); applyPoseFrame(G.players[id], t); }
+    for(const id in G.players){
+      const q = G.players[id];
+      ensurePlayerVisual(q); applyPoseFrame(q, t);
+      // Booth privacy: in your booth you are alone — you see nobody and nobody sees you.
+      // Your own figure always stays visible to you; you're painting it.
+      if(q.obj) q.obj.visible = (id===G.myId) ? true : !(q.booth || boothMode);
+    }
     if(G.phase==='reveal' && tour) updateTour(dt);
     else updateCamera(mode);
     if(typeof updateGunFrame==='function') updateGunFrame(t, dt, mode==='walk' && G.phase==='hunt');
@@ -5315,6 +5415,7 @@ function step(t, dt){
     updateTracers();
     updateListener();
     updateSeekerWhistle(t);
+    updateFlashlight();
     updateMinimap();
   }
 }
@@ -5383,6 +5484,8 @@ $('btnCancelConn').onclick = ()=> connFail('');
 $('btnLeaveLobby').onclick = leaveToMenu;
 $('btnBoardLeave').onclick = leaveToMenu;
 $('btnUnstick').onclick = ()=>{ forceUnstick(); $('btnUnstick').blur(); };
+$('btnFlash').onclick = ()=>{ toggleFlash(); $('btnFlash').blur(); };
+$('btnEnterMap').onclick = ()=>{ enterMap(); $('btnEnterMap').blur(); };
 $('btnStart').onclick = ()=>{ if(G.isHost && Object.keys(G.players).length>=2) hostStartRound(); };
 $('setMap').onchange = ()=>{ G.map = $('setMap').value; ensureMap(G.map); if(G.isHost && T) broadcastLobby(); };  // live map preview + tell clients
 $('btnNextRound').onclick = ()=>{ if(G.isHost) hostStartRound(); };
