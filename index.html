@@ -439,6 +439,7 @@ function LocalTransport(room, isHost, myId){
   T.toAll  = m => ch.postMessage({...m,_h:1});
   T.toOne  = (cid,m)=> ch.postMessage({...m,_h:1,_to:cid});
   T.toHost = m => ch.postMessage({...m,_c:1,_from:myId});
+  T.peerDead = ()=> false;   // BroadcastChannel has no liveness signal; same-device only
   T.hello  = name => ch.postMessage({t:'hello',name,_c:1,_from:myId});
   T.close  = ()=>{try{ch.close();}catch(e){}};
   T.ready = true;
@@ -478,6 +479,17 @@ function PeerTransport(room, isHost, myId){
     });
     T.toAll = m => { for(const id in conns){ try{conns[id].send(m);}catch(e){} } };
     T.toOne = (cid,m)=>{ if(conns[cid]) try{conns[cid].send(m);}catch(e){} };
+    // Is this peer REALLY gone? Ask the browser's WebRTC stack, not the game loop. A
+    // backgrounded tab / locked phone suspends rAF and throttles timers, so a live player
+    // goes silent while their connection stays perfectly healthy — silence must never be
+    // read as death or we kick people who just glanced at another app.
+    T.peerDead = pid => {
+      const c = conns[pid];
+      if(!c) return true;                       // never connected / already torn down
+      if(c.open === false) return true;         // data channel closed (tab closed)
+      const st = c.peerConnection && c.peerConnection.connectionState;
+      return st==='failed' || st==='closed';    // NOT 'disconnected' — that often recovers
+    };
     T.close = ()=>{ try{peer.destroy();}catch(e){} };
   }else{
     peer = new Peer({debug:1, config: ICE});
@@ -560,7 +572,6 @@ function hostAddPlayer(id, name){
   // joins allowed in the lobby AND between rounds (reveal/board); mid-round is busy
   if(G.phase!=='lobby' && G.phase!=='reveal'){ T.toOne(id,{t:'busy'}); return; }
   G.players[id] = newPlayer(id, name);
-  G.players[id].lastSeen = now();          // start the heartbeat clock
   ensurePlayerVisual(G.players[id]);
   T.toOne(id, {t:'welcome', you:id, room:G.room});
   broadcastLobby();
@@ -576,13 +587,20 @@ function hostAddPlayer(id, name){
   }
 }
 function hostPruneGhosts(t){
-  // Drop players whose tab died without a clean 'leave'/'close' (PeerJS 'close' is unreliable).
-  // Without this, a ghost lingers in the roster and gets dealt into the NEXT round.
+  // Drop players whose tab died without a clean 'leave'/'close' (PeerJS 'close' does not
+  // reliably fire on an abrupt close). Without this a ghost lingers in the roster, gets
+  // dealt a role in the NEXT round, and the round can never end — an uncatchable phantom.
+  // Liveness comes from T.peerDead (the browser's WebRTC state), NEVER from "they went
+  // quiet": a backgrounded tab or locked phone suspends rAF and throttles timers, so a
+  // live player stops sending for as long as they're away. Kicking on silence would boot
+  // anyone who glanced at another app.
   for(const id in G.players){
     if(id===G.myId) continue;
     const p = G.players[id];
-    if(p.lastSeen===undefined){ p.lastSeen = t; continue; }   // grace for a just-added player
-    if(t - p.lastSeen > GHOST_TIMEOUT) hostRemovePlayer(id);
+    if(T.peerDead && T.peerDead(id)){
+      if(p.deadSince===undefined) p.deadSince = t;             // start the confirm timer
+      else if(t - p.deadSince > GHOST_TIMEOUT) hostRemovePlayer(id);
+    }else p.deadSince = undefined;                             // recovered — forget it
   }
 }
 function hostRemovePlayer(id){
@@ -633,9 +651,7 @@ function clientHandle(m){
 }
 function hostHandle(id, m){
   const p = G.players[id]; if(!p) return;
-  p.lastSeen = now();                      // any message proves the client is still alive
   switch(m.t){
-    case 'ping': break;                    // heartbeat only — lastSeen already bumped
     case 'leave': hostRemovePlayer(id); break;
     case 'move': hostApplyMove(p, m); break;
     case 'paint':
@@ -4194,6 +4210,30 @@ function collides(x,y,z){
   }
   return null;
 }
+/* Shove the walking body out of any collider it is overlapping, along the shallowest
+   face. Two passes so an inside corner (overlapping two boxes) clears both. */
+function ejectFromGeometry(){
+  const H = 0.30;
+  for(let pass=0; pass<2; pass++){
+    const minX=ME.pos.x-H, maxX=ME.pos.x+H, minY=ME.pos.y+0.05, maxY=ME.pos.y+1.95,
+          minZ=ME.pos.z-H, maxZ=ME.pos.z+H;
+    let hit = null;
+    for(const c of colliders){
+      // Skip the map-spanning floor/ceiling shell. It isn't an obstacle, and "pushing out"
+      // of a box that covers the whole map would fling you to the map edge.
+      if(c.max.x-c.min.x >= MAP.w-2 && c.max.z-c.min.z >= MAP.d-2) continue;
+      if(maxX>c.min.x && minX<c.max.x && maxY>c.min.y && minY<c.max.y &&
+         maxZ>c.min.z && minZ<c.max.z){ hit = c; break; }
+    }
+    if(!hit) return;
+    const dxl = maxX-hit.min.x, dxr = hit.max.x-minX, dzl = maxZ-hit.min.z, dzr = hit.max.z-minZ;
+    const m = Math.min(dxl,dxr,dzl,dzr);
+    if(m===dxl)      ME.pos.x = hit.min.x - H - 0.002;
+    else if(m===dxr) ME.pos.x = hit.max.x + H + 0.002;
+    else if(m===dzl) ME.pos.z = hit.min.z - H - 0.002;
+    else             ME.pos.z = hit.max.z + H + 0.002;
+  }
+}
 function moveWalk(dt){   // grounded movement with collision — seeker FPS, or a running hider
   const p = me();
   const speed = (p.role==='seeker' ? SEEKER_SPEED : HIDER_SPEED) * (keys['shift']?1.35:1) * (G.speedMult||1);
@@ -4205,11 +4245,25 @@ function moveWalk(dt){   // grounded movement with collision — seeker FPS, or 
   const dx = (fx*cos + fz*sin)/len * speed * dt;
   const dz = (-fx*sin + fz*cos)/len * speed * dt;
   p._walk = !!(fx||fz);
-  // if already overlapping a collider (spawned/pushed into one), don't block movement —
-  // otherwise every candidate cell also collides and the seeker is frozen in place ("can't move")
-  const stuck = !!collides(ME.pos.x, ME.pos.y+0.05, ME.pos.z);
-  if((fx||fz) && dx && (stuck || !collides(ME.pos.x+dx, ME.pos.y+0.05, ME.pos.z))) ME.pos.x += dx;
-  if((fx||fz) && dz && (stuck || !collides(ME.pos.x, ME.pos.y+0.05, ME.pos.z+dz))) ME.pos.z += dz;
+  // Already overlapping geometry (spawned into a prop, a map rebuild moved a wall onto
+  // you)? Push OUT along the shallowest face. This replaces the old "if stuck, unblock
+  // ALL movement" hatch — that kept you from freezing, but it also meant anyone who got
+  // inside a wall could then walk around fully inside it, and straight out the far side.
+  // Ejecting keeps the never-frozen guarantee without handing out a pass through the map.
+  ejectFromGeometry();
+  // Substep. The old code tested only the DESTINATION, so one long frame jumped you clean
+  // past a wall: the watchdog below runs step() with dt up to 0.25s whenever rAF stalls
+  // (tab hidden, phone hitch, GC pause), which at sprint+2x speed is ~3.5 units in a single
+  // move — the wall never appeared in any test. 0.06 is under the thinnest collider (0.14
+  // gold frames), so every crossing is now caught mid-step.
+  if(fx||fz){
+    const n = Math.max(1, Math.ceil(Math.hypot(dx,dz)/0.06));
+    const sx = dx/n, sz = dz/n;
+    for(let i=0;i<n;i++){
+      if(sx && !collides(ME.pos.x+sx, ME.pos.y+0.05, ME.pos.z)) ME.pos.x += sx;
+      if(sz && !collides(ME.pos.x, ME.pos.y+0.05, ME.pos.z+sz)) ME.pos.z += sz;
+    }
+  }
   if(keys[' '] && ME.onGround){ ME.vel.y = JUMP_V; ME.onGround=false; }
   ME.vel.y -= GRAV*dt;
   let ny = ME.pos.y + ME.vel.y*dt;
@@ -4491,9 +4545,8 @@ function tryShoot(){
 /* =====================================================================
    HOST GAME LOGIC — rounds, phases, catches, whistles, scoring
    ===================================================================== */
-let lastStateSent = 0, lastMoveSent = 0, lastPingSent = 0;
-const PING_EVERY = 2.5;      // client heartbeat: send a keep-alive every 2.5s even when idle
-const GHOST_TIMEOUT = 10;    // host drops any player it hasn't heard from in 10s (dead tab / lost conn)
+let lastStateSent = 0, lastMoveSent = 0;
+const GHOST_TIMEOUT = 3;     // seconds the transport must stay dead before we drop a player
 
 function hostStartRound(){
   G.round++;
@@ -4513,12 +4566,17 @@ function hostStartRound(){
     const p = G.players[id];
     p.caught=false; p.stuck=0; p.pose='stand'; p._walk=false; p.whistleAt=0;
     p.role = seekSet.has(id) ? 'seeker' : 'hider';
+    // The random scatter around a spawn point can land you inside the furniture (the
+    // manor's rooms are dense), and a body that starts INSIDE a prop fights the collision
+    // resolver every frame and can barely move. Nudge every spawn to the nearest free spot.
     if(p.role==='seeker'){
-      p.x = sp.seeker[0] + (Math.random()*2-1); p.y=0; p.z = sp.seeker[1] + (Math.random()*2-1);
+      const s = findClearSpot(sp.seeker[0] + (Math.random()*2-1), sp.seeker[1] + (Math.random()*2-1));
+      p.x = s.x; p.y = 0; p.z = s.z;
     }else{
       G.roundHiders.push(id);
       const rc = sp.hiders[hi % sp.hiders.length]; hi++;   // scatter across the rooms
-      p.x = rc[0] + (Math.random()*5-2.5); p.y=0; p.z = rc[1] + (Math.random()*5-2.5);
+      const s = findClearSpot(rc[0] + (Math.random()*5-2.5), rc[1] + (Math.random()*5-2.5));
+      p.x = s.x; p.y = 0; p.z = s.z;
     }
     p.ry = Math.random()*Math.PI*2;
     if(p.mat){ p.mat.transparent=false; p.mat.opacity=1; }
@@ -5220,12 +5278,9 @@ function updateHud(){
 let lastSimAt = now(), lastFrameAt = 0;
 function step(t, dt){
   lastSimAt = t;
-  // heartbeat — runs in EVERY screen so ghosts are pruned between rounds and in the lobby.
-  // Host prunes silent players; clients send a keep-alive even when idle (reveal/board).
-  if(T){
-    if(G.isHost) hostPruneGhosts(t);
-    else if(t-lastPingSent>PING_EVERY){ lastPingSent=t; try{ T.toHost({t:'ping'}); }catch(e){} }
-  }
+  // Prune dead connections in EVERY screen, so a closed tab is gone from the roster before
+  // the next round is dealt (lobby and reveal/board included, not just during play).
+  if(T && G.isHost) hostPruneGhosts(t);
   if(G.screen==='menu' || G.screen==='lobby' || G.screen==='connecting'){
     const a = t*0.10;
     camera.position.set(Math.cos(a)*17, 8, Math.sin(a)*17);
